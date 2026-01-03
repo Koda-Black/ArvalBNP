@@ -1,0 +1,10 @@
+# Arval BNP Voice Agent - Data Directory
+
+This directory stores the application data files:
+
+- `appointments.json` - Stored appointment bookings
+- `leads.json` - Captured lead information
+- `callbacks.json` - Scheduled callback requests
+
+**Note:** These files are automatically created when data is saved.
+Data files are git-ignored to protect customer information.
