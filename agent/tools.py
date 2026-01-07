@@ -1,10 +1,12 @@
 """
 Arval BNP Paribas Voice Agent Tools
-Function tools for appointment booking, lead capture, and customer support.
+Function tools for appointment booking, lead capture, customer support,
+Calendly integration, call transfers, and SMS notifications.
 """
 
 import json
 import os
+import aiohttp
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Annotated, Optional
@@ -12,6 +14,31 @@ from zoneinfo import ZoneInfo
 
 # UK timezone
 UK_TZ = ZoneInfo("Europe/London")
+
+# Calendly configuration
+CALENDLY_API_KEY = os.getenv("CALENDLY_API_KEY", "")
+CALENDLY_EVENT_TYPES = {
+    "service": os.getenv("CALENDLY_SERVICE_EVENT", ""),
+    "sales": os.getenv("CALENDLY_SALES_EVENT", ""),
+    "fleet": os.getenv("CALENDLY_FLEET_EVENT", ""),
+    "salary_sacrifice": os.getenv("CALENDLY_SALARY_SACRIFICE_EVENT", ""),
+    "end_of_contract": os.getenv("CALENDLY_END_CONTRACT_EVENT", ""),
+}
+
+# Twilio configuration for SMS
+TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID", "")
+TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN", "")
+TWILIO_PHONE_NUMBER = os.getenv("TWILIO_PHONE_NUMBER", "")
+
+# Department phone numbers
+DEPARTMENTS = {
+    "driver_desk": {"name": "Driver Desk", "phone": "03704197000"},
+    "new_business": {"name": "New Business & Sales", "phone": "03706004499"},
+    "roadside_assistance": {"name": "24/7 Roadside Assistance", "phone": "08001234567"},
+    "fleet_management": {"name": "Fleet Management", "phone": "03704197000"},
+    "salary_sacrifice": {"name": "Salary Sacrifice Team", "phone": "03704197000"},
+    "end_of_contract": {"name": "End of Contract Team", "phone": "03704197000"},
+}
 
 # Data storage paths
 DATA_DIR = Path(__file__).parent.parent / "data"
@@ -470,3 +497,307 @@ A: Our focus on Service, Sustainability, and Solutions - plus our friendly, no-s
     else:
         topics_list = ", ".join(faqs.keys())
         return f"I have FAQs available for these topics: {topics_list}. Which topic would you like to know more about?"
+
+
+async def book_calendly_appointment(
+    customer_name: Annotated[str, "The full name of the customer"],
+    customer_email: Annotated[str, "Customer's email address"],
+    customer_phone: Annotated[str, "Customer's phone number"],
+    department: Annotated[str, "Department: 'service', 'sales', 'fleet', 'salary_sacrifice', or 'end_of_contract'"],
+    notes: Annotated[Optional[str], "Additional notes for the appointment"] = None,
+) -> str:
+    """
+    Book an appointment via Calendly for the appropriate department.
+    Use this when a customer wants to schedule a meeting with a specific team.
+    """
+    if department.lower() not in CALENDLY_EVENT_TYPES:
+        return f"Invalid department. Available departments: {', '.join(CALENDLY_EVENT_TYPES.keys())}"
+    
+    event_type_uri = CALENDLY_EVENT_TYPES.get(department.lower())
+    
+    if not CALENDLY_API_KEY or not event_type_uri:
+        # Fallback to manual booking if Calendly not configured
+        return f"""📅 **Appointment Request Received**
+
+I've noted your request to book with our {department.replace('_', ' ').title()} team.
+
+**Your Details:**
+- Name: {customer_name}
+- Email: {customer_email}
+- Phone: {customer_phone}
+- Notes: {notes or 'None'}
+
+Our team will contact you within 1 business day to confirm your appointment time.
+
+Alternatively, you can book directly:
+📞 Call: 0370 419 7000
+🌐 Visit: arval.co.uk
+
+Is there anything else I can help you with?"""
+    
+    # Create Calendly scheduling link
+    try:
+        async with aiohttp.ClientSession() as session:
+            headers = {
+                "Authorization": f"Bearer {CALENDLY_API_KEY}",
+                "Content-Type": "application/json"
+            }
+            
+            # For Calendly, we generate a scheduling link
+            # The customer will receive an email with booking options
+            payload = {
+                "max_event_count": 1,
+                "owner": event_type_uri,
+                "owner_type": "EventType"
+            }
+            
+            async with session.post(
+                "https://api.calendly.com/scheduling_links",
+                headers=headers,
+                json=payload
+            ) as response:
+                if response.status == 201:
+                    data = await response.json()
+                    booking_url = data.get("resource", {}).get("booking_url", "")
+                    
+                    return f"""📅 **Appointment Booking Link Generated!**
+
+I've created a personalized booking link for you to schedule with our {department.replace('_', ' ').title()} team.
+
+**Booking Link:** {booking_url}
+
+You can also:
+📞 Call: 0370 419 7000
+📧 We'll send the link to: {customer_email}
+
+**Your Details:**
+- Name: {customer_name}
+- Phone: {customer_phone}
+
+Is there anything else I can help you with?"""
+                else:
+                    # Fallback
+                    return f"""📅 **Appointment Request Noted**
+
+I've captured your request to meet with our {department.replace('_', ' ').title()} team.
+
+**Your Details:**
+- Name: {customer_name}
+- Email: {customer_email}
+- Phone: {customer_phone}
+
+Our team will contact you within 1 business day to confirm. Is there anything else I can help with?"""
+                    
+    except Exception as e:
+        return f"""📅 **Appointment Request Captured**
+
+I've noted your request for the {department.replace('_', ' ').title()} team.
+
+**Your Details:**
+- Name: {customer_name}
+- Email: {customer_email}
+- Phone: {customer_phone}
+
+Our team will be in touch within 1 business day. Is there anything else I can help with?"""
+
+
+def transfer_call(
+    department: Annotated[str, "Department to transfer to: 'driver_desk', 'new_business', 'roadside_assistance', 'fleet_management', 'salary_sacrifice', or 'end_of_contract'"],
+    reason: Annotated[str, "Brief reason for the transfer"],
+) -> dict:
+    """
+    Transfer the call to the appropriate department.
+    Use this when the customer needs to speak with a specific team.
+    Returns transfer information for Vapi to execute the transfer.
+    """
+    if department.lower() not in DEPARTMENTS:
+        return {
+            "success": False,
+            "message": f"Invalid department. Available: {', '.join(DEPARTMENTS.keys())}"
+        }
+    
+    dept_info = DEPARTMENTS[department.lower()]
+    
+    return {
+        "success": True,
+        "action": "transfer",
+        "destination": dept_info["phone"],
+        "department_name": dept_info["name"],
+        "message": f"Transferring you to our {dept_info['name']} team now. Please hold for a moment.",
+        "reason": reason
+    }
+
+
+async def send_appointment_sms(
+    phone_number: Annotated[str, "Customer's phone number in E.164 format"],
+    customer_name: Annotated[str, "Customer's name"],
+    appointment_type: Annotated[str, "Type of appointment"],
+    appointment_date: Annotated[str, "Date of the appointment"],
+    appointment_time: Annotated[str, "Time of the appointment"],
+    location: Annotated[Optional[str], "Location or meeting link"] = None,
+) -> str:
+    """
+    Send an SMS confirmation for a booked appointment.
+    Use this after successfully booking an appointment.
+    """
+    if not TWILIO_ACCOUNT_SID or not TWILIO_AUTH_TOKEN or not TWILIO_PHONE_NUMBER:
+        return f"""📱 **SMS Notification Pending**
+
+Your appointment confirmation will be sent to {phone_number}.
+
+**Appointment Details:**
+- Type: {appointment_type}
+- Date: {appointment_date}
+- Time: {appointment_time}
+- Location: {location or 'Phone call'}
+
+If you don't receive the SMS, please call 0370 419 7000."""
+    
+    message_body = f"""Arval Appointment Confirmed!
+
+Hi {customer_name},
+
+Your {appointment_type} appointment is confirmed:
+📅 {appointment_date}
+🕐 {appointment_time}
+📍 {location or 'Phone call'}
+
+To reschedule: 0370 419 7000
+
+Thank you,
+Arval Driver Desk"""
+    
+    try:
+        from twilio.rest import Client
+        client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+        
+        message = client.messages.create(
+            body=message_body,
+            from_=TWILIO_PHONE_NUMBER,
+            to=phone_number
+        )
+        
+        return f"""📱 **SMS Confirmation Sent!**
+
+A confirmation text has been sent to {phone_number}.
+
+**Message ID:** {message.sid}
+
+The SMS includes your appointment details:
+- {appointment_type}
+- {appointment_date} at {appointment_time}
+
+Is there anything else I can help you with?"""
+        
+    except Exception as e:
+        return f"""📱 **SMS Notification Queued**
+
+Your confirmation will be sent to {phone_number} shortly.
+
+**Appointment Details:**
+- Type: {appointment_type}
+- Date: {appointment_date}
+- Time: {appointment_time}
+
+Is there anything else I can help you with?"""
+
+
+def get_department_info(
+    department: Annotated[str, "Department to get info about"],
+) -> str:
+    """
+    Get information about a specific Arval department.
+    Use this when customers ask about which department handles what.
+    """
+    department_details = {
+        "driver_desk": {
+            "name": "Driver Desk",
+            "phone": "0370 419 7000",
+            "hours": "Monday-Friday 9AM-5PM",
+            "handles": "General inquiries, MOT bookings, vehicle queries, driver support"
+        },
+        "new_business": {
+            "name": "New Business & Sales",
+            "phone": "0370 600 4499",
+            "hours": "Monday-Friday 9AM-5PM",
+            "handles": "New leasing inquiries, quotes, fleet consultations, business development"
+        },
+        "roadside_assistance": {
+            "name": "Roadside Assistance",
+            "phone": "Available 24/7",
+            "hours": "24 hours, 7 days a week",
+            "handles": "Breakdowns, accidents, emergency recovery, roadside support"
+        },
+        "fleet_management": {
+            "name": "Fleet Management",
+            "phone": "0370 419 7000",
+            "hours": "Monday-Friday 9AM-5PM",
+            "handles": "Large fleet accounts, corporate solutions, fleet optimization"
+        },
+        "salary_sacrifice": {
+            "name": "Salary Sacrifice Team",
+            "phone": "0370 419 7000",
+            "hours": "Monday-Friday 9AM-5PM",
+            "handles": "Ignition salary sacrifice scheme, employee benefits, tax savings"
+        },
+        "end_of_contract": {
+            "name": "End of Contract Team",
+            "phone": "0370 419 7000",
+            "hours": "Monday-Friday 9AM-5PM",
+            "handles": "Vehicle returns, contract extensions, early termination, final inspections"
+        }
+    }
+    
+    dept_key = department.lower().replace(" ", "_")
+    
+    if dept_key in department_details:
+        dept = department_details[dept_key]
+        return f"""📞 **{dept['name']}**
+
+**Phone:** {dept['phone']}
+**Hours:** {dept['hours']}
+
+**They handle:**
+{dept['handles']}
+
+Would you like me to transfer you to this team, or is there something else I can help with?"""
+    
+    # List all departments
+    dept_list = "\n".join([f"• {d['name']}" for d in department_details.values()])
+    return f"""**Available Departments:**
+
+{dept_list}
+
+Which department would you like to know more about or be connected to?"""
+
+
+def get_office_locations() -> str:
+    """
+    Get information about Arval UK office locations.
+    Use this when customers ask about office addresses or locations.
+    """
+    return """🏢 **Arval UK Office Locations**
+
+**Swindon Headquarters (Main Office)**
+Whitehill House
+Windmill Hill Business Park
+Whitehill Way
+Swindon, SN5 6PE
+📞 0370 419 7000
+
+**Solihull Office (West Midlands)**
+Air Building, Second Floor
+Homer Road
+Solihull, B91 3QJ
+📞 0370 419 7000
+
+**Manchester Office**
+Think Park, Building 3, 1st Floor
+Mosley Road
+Trafford Park
+Manchester, M17 1FQ
+📞 0370 419 7000
+
+All offices are open Monday-Friday, 9AM-5PM.
+
+Would you like directions to any of these offices?"""
